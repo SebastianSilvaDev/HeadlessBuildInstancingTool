@@ -1,15 +1,17 @@
 use clap::Parser;
 use firebase_rs::*;
+use serde::{Deserialize, Serialize};
 use std::process::{Child, Command};
 use sysinfo::{ProcessExt, System, SystemExt};
-use serde::{Serialize, Deserialize};
 
-// The Urls have been removed because of safety issues
-const FIREBASE_URL: &str = "https://your-base.firebaseio.com";
-const TPVEH_BACKEND_URL: &str = "https://backend.com/";
-const USER_PREFIX: &str = "user_prefix";
-const PATH_TO_AUTH: &str = "game_path";
-const TEST_PSW: &str = "secretpassword";
+#[derive(Debug, Serialize, Deserialize)]
+struct GlobalConfigs {
+    firebase_url: String,
+    backend_url: String,
+    user_prefix: String,
+    path_to_auth: String,
+    test_psw: String,
+}
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -28,19 +30,19 @@ struct Args {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct StressTestVariables {
-    #[serde(rename(serialize="user-number"))]
+    #[serde(rename(serialize = "user-number"))]
     user_number: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct LoginData {
     username: String,
-    password: String
+    password: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct TokenData {
-    token: String
+    token: String,
 }
 
 pub fn execute(exe: &str, args: &[&str]) -> Child {
@@ -60,16 +62,18 @@ async fn get_number(firebase: &Firebase) -> i32 {
     panic!("{_error}");
 }
 
-async fn set_next_number_of_users(firebase: &Firebase, current_number_of_users: i32, users_to_spawn: i32) {
+async fn set_next_number_of_users(
+    firebase: &Firebase,
+    current_number_of_users: i32,
+    users_to_spawn: i32,
+) {
     let next_number_of_users = current_number_of_users + users_to_spawn;
 
     let new_number = StressTestVariables {
         user_number: next_number_of_users,
     };
 
-    let update_response = firebase
-        .update(&new_number)
-        .await;
+    let update_response = firebase.update(&new_number).await;
 
     if update_response.is_err() {
         let _error = update_response.err().unwrap().to_string();
@@ -77,17 +81,22 @@ async fn set_next_number_of_users(firebase: &Firebase, current_number_of_users: 
     }
 }
 
-async fn get_user_token(username: String, password: String) -> Result<TokenData,()> {
+async fn get_user_token(
+    username: String,
+    password: String,
+    configurations: &GlobalConfigs,
+) -> Result<TokenData, ()> {
     let client = reqwest::Client::new();
-    let mut login_backend_url = TPVEH_BACKEND_URL.to_owned();
+    let mut login_backend_url = String::from(&configurations.backend_url);
     login_backend_url.push_str("api-token-auth/");
 
     let login_data = LoginData {
         username: username,
-        password: password
+        password: password,
     };
 
-    let response = client.post(login_backend_url)
+    let response = client
+        .post(login_backend_url)
         .form(&login_data)
         .send()
         .await;
@@ -103,12 +112,12 @@ async fn get_user_token(username: String, password: String) -> Result<TokenData,
     }
 
     let token_data = body.ok().unwrap();
-    return  Ok(token_data);
+    return Ok(token_data);
 }
 
-fn safe_auth_json(token_data: TokenData) {
+fn safe_auth_json(token_data: TokenData, configurations: &GlobalConfigs) {
     let mut path = String::from("./");
-    path.push_str(PATH_TO_AUTH);
+    path.push_str(&configurations.path_to_auth);
     path.push_str("/auth.json");
     println!("{path}");
     let _result = std::fs::write(path, serde_json::to_string_pretty(&token_data).unwrap());
@@ -117,18 +126,56 @@ fn safe_auth_json(token_data: TokenData) {
     }
 }
 
-async fn update_user_token(current_user_number: i32) -> Result<(), ()>{
-    let mut username: String = String::from(USER_PREFIX);
+async fn update_user_token(
+    current_user_number: i32,
+    configurations: &GlobalConfigs,
+) -> Result<(), ()> {
+    let mut username: String = String::from(&configurations.user_prefix);
     username.push_str(&current_user_number.to_string());
     println!("{username}");
-    let token_data = get_user_token(username, String::from(TEST_PSW)).await?;
-    safe_auth_json(token_data);
+    let token_data = get_user_token(
+        username,
+        String::from(&configurations.test_psw),
+        &configurations,
+    )
+    .await?;
+    safe_auth_json(token_data, &configurations);
     Ok(())
+}
 
+fn create_default_config_file() {
+    let default_config = GlobalConfigs {
+        firebase_url: String::from("default"),
+        backend_url: String::from("default"),
+        user_prefix: String::from("default"),
+        path_to_auth: String::from("default"),
+        test_psw: String::from("default")
+    };
+    let new_config = std::fs::File::create("./config.yml").expect("Error Creating File");
+    serde_yaml::to_writer(new_config, &default_config).expect("Couldn't write on new file");
+    println!("Created config file")
 }
 
 #[async_std::main]
 async fn main() -> Result<(), ()> {
+    let config_file_result =
+        std::fs::File::open("config.yml");
+    if config_file_result.is_err() {
+        create_default_config_file();
+        println!("Default Config Created, please fill up");
+        return Err(());
+    }
+    let configs_result: Result<GlobalConfigs, serde_yaml::Error> =
+        serde_yaml::from_reader(config_file_result.ok().unwrap());
+
+    if configs_result.is_err() {
+        create_default_config_file();
+        println!("No valid yaml to parse");
+        return Err(());
+    }
+
+    let configs = configs_result.ok().unwrap();
+
     let args: Args = Args::parse();
 
     let executable_name = args.executable_name;
@@ -142,7 +189,7 @@ async fn main() -> Result<(), ()> {
 
     let numer_times: i32 = args.number_of_instances;
 
-    let firebase = &Firebase::new(FIREBASE_URL)
+    let firebase = &Firebase::new(&configs.firebase_url)
         .unwrap()
         .at("stress-test-variables");
 
@@ -157,13 +204,15 @@ async fn main() -> Result<(), ()> {
     println!("Runing {numer_times} times");
     let mut children: Vec<Child> = Vec::new();
     for _i in 1..(numer_times + 1) {
-        update_user_token(initial_number_of_user + _i).await?;
+        update_user_token(initial_number_of_user + _i, &configs).await?;
 
         let child_result = execute(&path, &execution_args);
         children.push(child_result);
         println!("Process {_i} Spawned!");
         if args.time_between_executions.is_some() {
-            std::thread::sleep(std::time::Duration::from_secs(args.time_between_executions.unwrap()));
+            std::thread::sleep(std::time::Duration::from_secs(
+                args.time_between_executions.unwrap(),
+            ));
         }
     }
     println!("Finish spawning!");
